@@ -1,5 +1,5 @@
-pandas
-numpy
-google-adk
-langgraph
-google-generativeai
+langgraph>=0.0.20
+langchain>=0.1.0
+langchain-google-genai>=1.0.0
+pandas>=2.0.0
+python-dotenv>=1.0.0
