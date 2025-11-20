@@ -1,0 +1,5 @@
+pandas
+numpy
+google-adk
+langgraph
+google-generativeai
