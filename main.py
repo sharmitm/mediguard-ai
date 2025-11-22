@@ -5,6 +5,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 import pandas as pd
 from dotenv import load_dotenv
+from agents.discharge_agent import run_discharge_agent
 
 # Load environment variables from .env file
 load_dotenv()
@@ -61,16 +62,25 @@ Example: {{"billing_risk_score": 15, "billing_flags": ["normal_range"], "billing
 ])
 
 discharge_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are MediGuard Discharge Agent. You MUST respond with ONLY valid JSON, no markdown, no explanations."),
-    ("human", """Tasks: {tasks}
+    ("system",  
+     "You are the MediGuard Discharge Agent. "
+     "Your job is to analyze pending tasks, missing records, incomplete labs, and determine "
+     "if the patient is ready for discharge. "
+     "ALWAYS return strictly valid JSON. No extra text."),
+     
+    ("human",  
+     """Tasks List: {tasks}
 
-Return ONLY a JSON object with these exact fields:
-- discharge_ready (boolean)
-- blockers (array of strings)
-- delay_hours (number)
-
-Example: {{"discharge_ready": true, "blockers": [], "delay_hours": 0}}""")
+Analyze the tasks carefully and return only this JSON:
+{
+  "discharge_ready": <true/false>,
+  "blockers": [list of strings],
+  "delay_hours": <number>,
+  "priority_level": "LOW" | "MEDIUM" | "HIGH"
+}
+""")
 ])
+
 
 # Create chains
 identity_chain = identity_prompt | llm
@@ -120,22 +130,34 @@ def billing_node(state):
     }
 
 def discharge_node(state):
-    """Discharge readiness assessment"""
-    response = discharge_chain.invoke({"tasks": json.dumps(state["raw"]["tasks"])})
+    """LLM-based discharge analysis agent"""
+    
+    raw_tasks = state["raw"]["tasks"]
+    response = discharge_chain.invoke({"tasks": json.dumps(raw_tasks)})
+
+    # Clean + Parse LLM JSON
     content = response.content.strip()
     if content.startswith("```"):
         content = content.split("```")[1]
         if content.startswith("json"):
             content = content[4:]
         content = content.strip()
-    result = json.loads(content)
-    
-    # Return updated state with final combined results
+
+    discharge_result = json.loads(content)
+
+    # Merge with the other agents
+    combined = {
+        **state["identity"],
+        **state["billing"],
+        **discharge_result
+    }
+
     return {
         **state,
-        "discharge": result, 
-        "final": {**state["identity"], **state["billing"], **result}
+        "discharge": discharge_result,
+        "final": combined
     }
+
 
 # Build workflow
 workflow = StateGraph(dict)
