@@ -1,20 +1,42 @@
+"""
+MediGuard AI - Healthcare Fraud Detection System
+Implemented using Google ADK instead of LangChain/LangGraph
+"""
 import json
 import os
-from langgraph.graph import StateGraph, END
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
+import sys
+import logging
+import time
+import asyncio
+from typing import Dict, Any
 import pandas as pd
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Google ADK imports
+from google.adk.agents import LlmAgent, SequentialAgent
+from google.adk.models import Gemini
+from google.adk.sessions import InMemorySessionService
+from google.adk.runners import types
+
+# Import tools
+from tools_adk import (
+    fetch_patient_data_tool,
+    fetch_patient_data_direct,
+    calculate_claim_statistics,
+    check_patient_consistency,
+    analyze_diagnosis_procedure_match,
+    initialize_tools_data
+)
+
+# Load environment variables
 load_dotenv()
 
-# Initialize LLM with API key from environment
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash-lite", 
-    temperature=0.0,
-    google_api_key=os.getenv("GOOGLE_API_KEY")
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
 # Load all Synthea data from data1/ folder
 def load_all_data():
@@ -27,275 +49,585 @@ def load_all_data():
 
 # Load data at startup
 patients, claims, claim_lines = load_all_data()
+logger.info(f"Loaded data: {len(patients)} patients, {len(claims)} claims, {len(claim_lines)} claim lines")
 
-def fetch_patient_data(patient_id):
-    """Fetch patient data, claims, and claim lines from Synthea data"""
-    # Validate patient exists
-    if patient_id not in patients.index:
-        raise ValueError(f"Patient ID {patient_id} not found in patients.csv")
+# Initialize tools with data
+initialize_tools_data(patients, claims, claim_lines)
+
+# Initialize Gemini model
+model = Gemini(
+    model_name="gemini-2.5-flash-lite",
+    temperature=0.0,
+    api_key=os.getenv("GOOGLE_API_KEY")
+)
+
+# ============================================================================
+# AGENT DEFINITIONS
+# ============================================================================
+
+# Agent 1: Identity & Claims Fraud Detection
+identity_agent = LlmAgent(
+    name="identity_agent",
+    model=model,
+    tools=[
+        fetch_patient_data_tool,
+        calculate_claim_statistics,
+        check_patient_consistency
+    ],
+    instruction="""You are MediGuard Identity & Claims Fraud Detection Agent. 
+
+Your role is to analyze patient data for fraud and identity misuse patterns.
+
+You MUST:
+1. Use the fetch_patient_data_tool to get patient information when given a patient_id
+2. Analyze the data for:
+   - Duplicate or inconsistent patient information across claims (compare SSN, DOB, name, address)
+   - Suspicious diagnosis-procedure combinations (procedures that don't match diagnoses)
+   - Claims with unusually high or unrealistic amounts (compare total_claim_cost to typical ranges)
+   - Patterns commonly associated with identity misuse (multiple claims with different patient details, rapid claim sequences, etc.)
+3. Use calculate_claim_statistics tool to get statistical insights
+4. Use check_patient_consistency tool to verify data consistency
+
+You MUST respond with ONLY valid JSON in this exact format:
+{
+    "fraud_risk_score": <number 0-100>,
+    "identity_misuse_flag": <boolean>,
+    "reasons": [<array of strings>]
+}
+
+Do NOT include markdown code blocks, explanations, or any text outside the JSON object.
+Return ONLY the raw JSON object.
+
+Example output:
+{"fraud_risk_score": 45, "identity_misuse_flag": true, "reasons": ["Duplicate patient information across multiple claims", "Suspicious diagnosis-procedure combination detected"]}"""
+)
+
+# Agent 2: Billing Fraud Analysis
+billing_agent = LlmAgent(
+    name="billing_agent",
+    model=model,
+    tools=[
+        calculate_claim_statistics,
+        analyze_diagnosis_procedure_match
+    ],
+    instruction="""You are MediGuard Billing Fraud Agent.
+
+Your role is to analyze billing for fraud based on identity analysis results.
+
+You MUST:
+1. Review the identity analysis results provided
+2. Use calculate_claim_statistics tool to analyze claim costs
+3. Use analyze_diagnosis_procedure_match tool to verify procedure-diagnosis matches
+4. Check for:
+   - Procedures not supported by diagnosis
+   - Duplicate/add-on procedures
+   - Charges above normal ranges
+   - Suspicious billing combinations
+
+You MUST respond with ONLY valid JSON in this exact format:
+{
+    "billing_risk_score": <number 0-100>,
+    "billing_flags": [<array of strings>],
+    "billing_explanation": <string>
+}
+
+Do NOT include markdown code blocks, explanations, or any text outside the JSON object.
+Return ONLY the raw JSON object.
+
+Example output:
+{"billing_risk_score": 15, "billing_flags": ["normal_range"], "billing_explanation": "No billing anomalies"}"""
+)
+
+# Agent 3: Discharge Blockers Assessment
+discharge_agent = LlmAgent(
+    name="discharge_agent",
+    model=model,
+    tools=[],
+    instruction="""You are MediGuard Discharge Agent.
+
+Your role is to assess discharge readiness and identify blockers.
+
+You MUST:
+1. Review the tasks/blockers provided
+2. Determine if patient is ready for discharge
+3. Identify what blockers exist (pending labs, scans, paperwork, etc.)
+4. Estimate delay hours if not ready
+
+You MUST respond with ONLY valid JSON in this exact format:
+{
+    "discharge_ready": <boolean>,
+    "blockers": [<array of strings>],
+    "delay_hours": <number>
+}
+
+Do NOT include markdown code blocks, explanations, or any text outside the JSON object.
+Return ONLY the raw JSON object.
+
+Example output:
+{"discharge_ready": true, "blockers": [], "delay_hours": 0}"""
+)
+
+# Create Sequential workflow (replaces StateGraph)
+workflow = SequentialAgent(
+    name="mediguard_workflow",
+    sub_agents=[identity_agent, billing_agent, discharge_agent]
+)
+
+# Create Runner for executing agents
+from google.adk import Runner
+session_service = InMemorySessionService()
+runner = Runner(
+    agent=workflow,
+    app_name="mediguard_workflow",
+    session_service=session_service
+)
+identity_runner = Runner(
+    agent=identity_agent,
+    app_name="identity_agent",
+    session_service=session_service
+)
+
+# ============================================================================
+# ANALYSIS FUNCTIONS
+# ============================================================================
+
+def parse_agent_response(response: Any) -> str:
+    """Parse ADK agent response to extract text content from events"""
+    # If response is a list of events, find the final response
+    if isinstance(response, list):
+        # Find the final response event
+        final_event = None
+        for event in response:
+            if hasattr(event, 'is_final_response') and event.is_final_response():
+                final_event = event
+                break
+        # If no final event found, use the last event
+        if final_event is None and response:
+            final_event = response[-1]
+        response = final_event
     
-    # Helper function to convert numpy types to native Python types
-    def to_native_type(val):
-        if pd.isna(val):
-            return None
-        # Convert numpy types to native Python types
-        if hasattr(val, 'item'):
-            return val.item()
-        return val
-    
-    # Get patient data
-    patient_row = patients.loc[patient_id]
-    patient_dict = {
-        "Id": str(patient_id),
-        "SSN": str(to_native_type(patient_row.get("SSN", ""))) if pd.notna(patient_row.get("SSN")) else "",
-        "BIRTHDATE": str(to_native_type(patient_row.get("BIRTHDATE", ""))) if pd.notna(patient_row.get("BIRTHDATE")) else "",
-        "FIRST": str(to_native_type(patient_row.get("FIRST", ""))) if pd.notna(patient_row.get("FIRST")) else "",
-        "LAST": str(to_native_type(patient_row.get("LAST", ""))) if pd.notna(patient_row.get("LAST")) else "",
-        "ADDRESS": str(to_native_type(patient_row.get("ADDRESS", ""))) if pd.notna(patient_row.get("ADDRESS")) else "",
-        "CITY": str(to_native_type(patient_row.get("CITY", ""))) if pd.notna(patient_row.get("CITY")) else "",
-        "STATE": str(to_native_type(patient_row.get("STATE", ""))) if pd.notna(patient_row.get("STATE")) else "",
-        "ZIP": str(to_native_type(patient_row.get("ZIP", ""))) if pd.notna(patient_row.get("ZIP")) else "",
-        "PHONE": str(to_native_type(patient_row.get("PHONE", ""))) if pd.notna(patient_row.get("PHONE")) else "",
-        "EMAIL": str(to_native_type(patient_row.get("EMAIL", ""))) if pd.notna(patient_row.get("EMAIL")) else ""
-    }
-    
-    # Get all claims for this patient
-    patient_claims = claims[claims["patient_id"] == patient_id]
-    claims_list = []
-    
-    for _, claim_row in patient_claims.iterrows():
-        claim_dict = {
-            "claim_id": str(to_native_type(claim_row.get("claim_id", ""))),
-            "primary_diagnosis_code": str(to_native_type(claim_row.get("primary_diagnosis_code", ""))) if pd.notna(claim_row.get("primary_diagnosis_code")) else "",
-            "primary_diagnosis_description": str(to_native_type(claim_row.get("primary_diagnosis_description", ""))) if pd.notna(claim_row.get("primary_diagnosis_description")) else "",
-            "total_claim_cost": float(to_native_type(claim_row.get("total_claim_cost", 0))),
-            "admission_date": str(to_native_type(claim_row.get("admission_date", ""))) if pd.notna(claim_row.get("admission_date")) else "",
-            "discharge_date": str(to_native_type(claim_row.get("discharge_date", ""))) if pd.notna(claim_row.get("discharge_date")) else "",
-            "service_date": str(to_native_type(claim_row.get("service_date", ""))) if pd.notna(claim_row.get("service_date")) else "",
-            "encounter_class": str(to_native_type(claim_row.get("encounter_class", ""))) if pd.notna(claim_row.get("encounter_class")) else ""
-        }
-        claims_list.append(claim_dict)
-    
-    # Get claim lines for this patient's claims
-    if len(claims_list) > 0:
-        claim_ids = [c["claim_id"] for c in claims_list]
-        patient_claim_lines = claim_lines[claim_lines["claim_id"].isin(claim_ids)]
-        claim_lines_list = []
+    # Extract content from event
+    if response and hasattr(response, 'content'):
+        content = response.content
         
-        for _, line_row in patient_claim_lines.iterrows():
-            line_dict = {
-                "claim_id": str(to_native_type(line_row.get("claim_id", ""))),
-                "line_id": int(to_native_type(line_row.get("line_id", 0))),
-                "cpt_hcpcs_code": str(to_native_type(line_row.get("cpt_hcpcs_code", ""))) if pd.notna(line_row.get("cpt_hcpcs_code")) else "",
-                "description": str(to_native_type(line_row.get("description", ""))) if pd.notna(line_row.get("description")) else "",
-                "charge_amount": float(to_native_type(line_row.get("charge_amount", 0))),
-                "units": int(to_native_type(line_row.get("units", 1))),
-                "reason_code": str(to_native_type(line_row.get("reason_code", ""))) if pd.notna(line_row.get("reason_code")) else "",
-                "reason_description": str(to_native_type(line_row.get("reason_description", ""))) if pd.notna(line_row.get("reason_description")) else ""
-            }
-            claim_lines_list.append(line_dict)
-    else:
-        claim_lines_list = []
+        # Handle different content types
+        if content is None:
+            logger.warning(f"Response content is None for {type(response)}")
+            return ""
+        
+        # Content is a list of Content objects, extract text from parts
+        if isinstance(content, list) and len(content) > 0:
+            # Look through all content items, not just the last one
+            # The model response might be in a different content item
+            for content_item in reversed(content):  # Start from end
+                if content_item is None:
+                    continue
+                if hasattr(content_item, 'parts') and content_item.parts:
+                    # Extract text from all parts (skip function_call parts)
+                    text_parts = []
+                    for part in content_item.parts:
+                        # Check if part has text attribute and it's not None/empty
+                        if hasattr(part, 'text') and part.text:
+                            text_parts.append(str(part.text).strip())
+                    if text_parts:
+                        return " ".join(text_parts)
+        elif content and not isinstance(content, list):
+            # Single content object
+            if hasattr(content, 'parts') and content.parts:
+                text_parts = []
+                for part in content.parts:
+                    if hasattr(part, 'text') and part.text:
+                        text_parts.append(str(part.text).strip())
+                if text_parts:
+                    return " ".join(text_parts)
     
-    # Tasks list (empty for now - can be loaded from tasks.csv if available)
-    tasks_list = []
+    # Try to get text directly from response if it's a string
+    if isinstance(response, str):
+        return response
     
-    return {
-        "patient": patient_dict,
-        "claims": claims_list,
-        "claim_lines": claim_lines_list,
-        "tasks": tasks_list
-    }
-
-# Define agent prompts
-identity_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are MediGuard Identity & Claims Fraud Agent. You MUST respond with ONLY valid JSON, no markdown, no explanations, just raw JSON."),
-    ("human", """Patient Information: {patient}
-Claims: {claims}
-Claim Lines: {claim_lines}
-
-Analyze this patient's data for fraud and identity misuse. Check for:
-1. Duplicate or inconsistent patient information across claims (compare SSN, DOB, name, address)
-2. Suspicious diagnosis-procedure combinations (procedures that don't match diagnoses)
-3. Claims with unusually high or unrealistic amounts (compare total_claim_cost to typical ranges)
-4. Patterns commonly associated with identity misuse (multiple claims with different patient details, rapid claim sequences, etc.)
-
-Return ONLY a JSON object with these exact fields:
-- fraud_risk_score (number 0-100) - overall fraud risk assessment
-- identity_misuse_flag (boolean) - true if identity misuse is detected, false otherwise
-- reasons (array of strings) - list of specific reasons/flags found
-
-Example: {{"fraud_risk_score": 45, "identity_misuse_flag": true, "reasons": ["Duplicate patient information across multiple claims", "Suspicious diagnosis-procedure combination detected"]}}""")
-])
-
-billing_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are MediGuard Billing Fraud Agent. You MUST respond with ONLY valid JSON, no markdown, no explanations."),
-    ("human", """Identity Analysis: {identity}
-
-Return ONLY a JSON object with these exact fields:
-- billing_risk_score (number 0-100)
-- billing_flags (array of strings)
-- billing_explanation (string)
-
-Example: {{"billing_risk_score": 15, "billing_flags": ["normal_range"], "billing_explanation": "No billing anomalies"}}""")
-])
-
-discharge_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are MediGuard Discharge Agent. You MUST respond with ONLY valid JSON, no markdown, no explanations."),
-    ("human", """Tasks: {tasks}
-
-Return ONLY a JSON object with these exact fields:
-- discharge_ready (boolean)
-- blockers (array of strings)
-- delay_hours (number)
-
-Example: {{"discharge_ready": true, "blockers": [], "delay_hours": 0}}""")
-])
-
-# Create chains
-identity_chain = identity_prompt | llm
-billing_chain = billing_prompt | llm
-discharge_chain = discharge_prompt | llm
-
-# LangGraph nodes
-def identity_node(state):
-    """Identity and claims fraud detection"""
-    data = fetch_patient_data(state["patient_id"])
+    # Try to access text attribute
+    if hasattr(response, 'text') and response.text:
+        return str(response.text)
     
-    # Invoke Agent 1 with patient, claims, and claim_lines
-    response = identity_chain.invoke({
-        "patient": json.dumps(data["patient"], indent=2), 
-        "claims": json.dumps(data["claims"], indent=2),
-        "claim_lines": json.dumps(data["claim_lines"], indent=2)
-    })
+    # Debug: log what we got
+    logger.warning(f"Could not extract text from response: {type(response)}")
+    if response:
+        logger.warning(f"Response attributes: {[x for x in dir(response) if not x.startswith('_')][:15]}")
+        if hasattr(response, 'content'):
+            logger.warning(f"Content type: {type(response.content)}, value: {response.content}")
     
-    # Clean the response - remove markdown code blocks if present
-    content = response.content.strip()
+    # Don't return str(response) - that's the object representation, not the actual text
+    return ""
+
+def clean_json_response(content: str) -> str:
+    """Clean JSON response by removing markdown code blocks"""
+    content = content.strip()
     if content.startswith("```"):
         content = content.split("```")[1]
         if content.startswith("json"):
             content = content[4:]
         content = content.strip()
-    
-    result = json.loads(content)
-    
-    # Validate output structure matches requirements
+    return content
+
+def validate_identity_result(result: Dict[str, Any]) -> None:
+    """Validate Agent 1 (Identity) output structure"""
     required_fields = ["fraud_risk_score", "identity_misuse_flag", "reasons"]
     for field in required_fields:
         if field not in result:
             raise ValueError(f"Agent 1 output missing required field: {field}")
     
-    # Ensure types are correct
     if not isinstance(result["fraud_risk_score"], (int, float)):
         raise ValueError("fraud_risk_score must be a number")
     if not isinstance(result["identity_misuse_flag"], bool):
         raise ValueError("identity_misuse_flag must be a boolean")
     if not isinstance(result["reasons"], list):
         raise ValueError("reasons must be an array")
+
+def validate_billing_result(result: Dict[str, Any]) -> None:
+    """Validate Agent 2 (Billing) output structure"""
+    required_fields = ["billing_risk_score", "billing_flags", "billing_explanation"]
+    for field in required_fields:
+        if field not in result:
+            raise ValueError(f"Agent 2 output missing required field: {field}")
+
+def validate_discharge_result(result: Dict[str, Any]) -> None:
+    """Validate Agent 3 (Discharge) output structure"""
+    required_fields = ["discharge_ready", "blockers", "delay_hours"]
+    for field in required_fields:
+        if field not in result:
+            raise ValueError(f"Agent 3 output missing required field: {field}")
+
+def analyze_patient(patient_id: str) -> Dict[str, Any]:
+    """
+    Main function to analyze a patient through all agents using ADK SequentialAgent.
     
-    # Return updated state with ALL previous state preserved
-    return {
-        **state,
-        "identity": result, 
-        "raw": data
-    }
-
-def billing_node(state):
-    """Billing fraud detection"""
-    response = billing_chain.invoke({"identity": json.dumps(state["identity"])})
-    content = response.content.strip()
-    if content.startswith("```"):
-        content = content.split("```")[1]
-        if content.startswith("json"):
-            content = content[4:]
-        content = content.strip()
-    result = json.loads(content)
-    
-    # Return updated state with ALL previous state preserved
-    return {
-        **state,
-        "billing": result
-    }
-
-def discharge_node(state):
-    """Discharge readiness assessment"""
-    # Get tasks from raw data if available, otherwise use empty list
-    tasks = state.get("raw", {}).get("tasks", [])
-    
-    response = discharge_chain.invoke({"tasks": json.dumps(tasks)})
-    content = response.content.strip()
-    if content.startswith("```"):
-        content = content.split("```")[1]
-        if content.startswith("json"):
-            content = content[4:]
-        content = content.strip()
-    result = json.loads(content)
-    
-    # Return updated state with final combined results
-    return {
-        **state,
-        "discharge": result, 
-        "final": {**state.get("identity", {}), **state.get("billing", {}), **result}
-    }
-
-# Build workflow
-workflow = StateGraph(dict)
-workflow.add_node("identity", identity_node)
-workflow.add_node("billing", billing_node)
-workflow.add_node("discharge", discharge_node)
-
-workflow.add_edge("identity", "billing")
-workflow.add_edge("billing", "discharge")
-workflow.add_edge("discharge", END)
-
-workflow.set_entry_point("identity")
-app = workflow.compile()
-
-def analyze_patient(patient_id):
-    """Main function to analyze a patient through all agents"""
-    result = app.invoke({"patient_id": patient_id})
-    return result  # Return full state, not just final
-
-def analyze_agent1_only(patient_id):
-    """Analyze a patient using only Agent 1 (Claims & Identity Fraud Agent)"""
+    Args:
+        patient_id: Patient UUID to analyze
+        
+    Returns:
+        Dictionary with complete workflow state including identity, billing, discharge, and final results
+    """
     try:
-        data = fetch_patient_data(patient_id)
-        response = identity_chain.invoke({
-            "patient": json.dumps(data["patient"], indent=2), 
-            "claims": json.dumps(data["claims"], indent=2),
-            "claim_lines": json.dumps(data["claim_lines"], indent=2)
-        })
+        return asyncio.run(analyze_patient_async(patient_id))
+    finally:
+        # Clean up any pending async tasks
+        try:
+            loop = asyncio.get_event_loop()
+            if not loop.is_closed():
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+        except:
+            pass
+
+async def analyze_patient_async(patient_id: str) -> Dict[str, Any]:
+    """
+    Async implementation of analyze_patient.
+    """
+    start_time = time.time()
+    logger.info(f"Starting full workflow analysis for patient: {patient_id}")
+    
+    try:
+        # Run agents individually in sequence (faster than SequentialAgent + individual runs)
+        # This avoids running agents twice and gives us all intermediate results
         
-        # Clean the response
-        content = response.content.strip()
-        if content.startswith("```"):
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-            content = content.strip()
+        # Step 1: Run identity agent
+        logger.info(f"Step 1: Running identity agent for patient {patient_id}")
+        identity_session = session_service.create_session_sync(
+            app_name="identity_agent",
+            user_id=f"user_{patient_id}",
+            session_id=f"session_{patient_id}_identity"
+        )
         
-        result = json.loads(content)
+        # Run identity agent separately to get its result
+        identity_prompt = f"Analyze patient {patient_id} for identity fraud. Use fetch_patient_data_tool to get data."
+        identity_message = types.Content(
+            parts=[types.Part(text=identity_prompt)],
+            role="user"
+        )
+        identity_events = []
+        async for event in identity_runner.run_async(
+            user_id=f"user_{patient_id}",
+            session_id=f"session_{patient_id}_identity",
+            new_message=identity_message
+        ):
+            identity_events.append(event)
+        identity_response = identity_events[-1] if identity_events else None
+        identity_content = parse_agent_response(identity_response)
+        if not identity_content or not identity_content.strip():
+            # Try extracting from all events if single event failed
+            logger.warning(f"Failed to extract from last event, trying all {len(identity_events)} events")
+            all_text = []
+            for i, event in enumerate(identity_events):
+                if hasattr(event, 'content') and event.content:
+                    content_list = event.content if isinstance(event.content, list) else [event.content]
+                    for content_item in content_list:
+                        if content_item and hasattr(content_item, 'parts') and content_item.parts:
+                            for part in content_item.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    all_text.append(str(part.text).strip())
+            if all_text:
+                identity_content = " ".join(all_text)
+                logger.info(f"Extracted identity content from all events: {len(identity_content)} chars")
+            else:
+                raise ValueError(f"Identity agent returned empty response. Events: {len(identity_events)}")
+        identity_content = clean_json_response(identity_content)
+        logger.info(f"Identity agent response length: {len(identity_content)} chars, preview: {identity_content[:200]}")
+        identity_result = json.loads(identity_content)
+        validate_identity_result(identity_result)
+        logger.info(f"Step 1 complete: Identity agent fraud_score={identity_result.get('fraud_risk_score', 0)}")
         
-        # Validate output structure
-        required_fields = ["fraud_risk_score", "identity_misuse_flag", "reasons"]
-        for field in required_fields:
-            if field not in result:
-                raise ValueError(f"Agent 1 output missing required field: {field}")
+        # Step 2: Run billing agent with identity result
+        logger.info(f"Step 2: Running billing agent for patient {patient_id}")
+        # Create session for billing agent
+        billing_session = session_service.create_session_sync(
+            app_name="billing_agent",
+            user_id=f"user_{patient_id}",
+            session_id=f"session_{patient_id}_billing"
+        )
+        
+        # Run billing agent with identity result
+        billing_runner = Runner(agent=billing_agent, app_name="billing_agent", session_service=session_service)
+        billing_prompt = f"Analyze billing fraud based on this identity analysis: {json.dumps(identity_result)}"
+        billing_message = types.Content(
+            parts=[types.Part(text=billing_prompt)],
+            role="user"
+        )
+        billing_events = []
+        async for event in billing_runner.run_async(
+            user_id=f"user_{patient_id}",
+            session_id=f"session_{patient_id}_billing",
+            new_message=billing_message
+        ):
+            billing_events.append(event)
+        billing_response = billing_events[-1] if billing_events else None
+        billing_content = parse_agent_response(billing_response)
+        if not billing_content or not billing_content.strip():
+            # Try extracting from all events if single event failed
+            logger.warning(f"Failed to extract from last event, trying all {len(billing_events)} events")
+            all_text = []
+            for i, event in enumerate(billing_events):
+                if hasattr(event, 'content') and event.content:
+                    content_list = event.content if isinstance(event.content, list) else [event.content]
+                    for content_item in content_list:
+                        if content_item and hasattr(content_item, 'parts') and content_item.parts:
+                            for part in content_item.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    all_text.append(str(part.text).strip())
+            if all_text:
+                billing_content = " ".join(all_text)
+                logger.info(f"Extracted billing content from all events: {len(billing_content)} chars")
+            else:
+                raise ValueError(f"Billing agent returned empty response. Events: {len(billing_events)}")
+        billing_content = clean_json_response(billing_content)
+        logger.info(f"Billing agent response length: {len(billing_content)} chars, preview: {billing_content[:200]}")
+        billing_result = json.loads(billing_content)
+        validate_billing_result(billing_result)
+        logger.info(f"Step 2 complete: Billing agent risk_score={billing_result.get('billing_risk_score', 0)}")
+        
+        # Step 3: Discharge agent - DISABLED (waiting for teammate's implementation)
+        logger.info(f"Step 3: Discharge agent skipped - waiting for implementation")
+        # Return default/empty discharge result without running the agent
+        discharge_result = {
+            "discharge_ready": True,  # Default to ready
+            "blockers": [],  # No blockers
+            "delay_hours": 0  # No delay
+        }
+        logger.info(f"Step 3 complete: Discharge agent skipped - using default values")
+        
+        # Get raw data for final result
+        raw_data = fetch_patient_data_direct(patient_id)
+        
+        # Combine all results
+        result = {
+            "patient_id": patient_id,
+            "identity": identity_result,
+            "billing": billing_result,
+            "discharge": discharge_result,
+            "raw": raw_data,
+            "final": {
+                **identity_result,
+                **billing_result,
+                **discharge_result
+            }
+        }
+        
+        duration = (time.time() - start_time) * 1000
+        logger.info(f"Workflow analysis complete: duration={duration:.2f}ms, fraud_score={identity_result.get('fraud_risk_score', 0)}")
         
         return result
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing error: {str(e)}")
+        raise ValueError(f"Failed to parse agent response as JSON: {str(e)}")
     except ValueError as e:
-        raise ValueError(f"Error analyzing patient: {str(e)}")
+        logger.error(f"Validation error: {str(e)}")
+        raise
     except Exception as e:
-        raise Exception(f"Unexpected error: {str(e)}")
+        duration = (time.time() - start_time) * 1000
+        logger.error(f"Unexpected error during workflow analysis: {str(e)}, duration={duration:.2f}ms", exc_info=True)
+        raise Exception(f"Error analyzing patient: {str(e)}")
 
-def get_sample_patient_ids(limit=10):
+def analyze_agent1_only(patient_id: str) -> Dict[str, Any]:
+    """
+    Analyze a patient using only Agent 1 (Identity & Claims Fraud Detection) with ADK.
+    
+    Args:
+        patient_id: Patient UUID to analyze
+        
+    Returns:
+        Dictionary with analysis results containing:
+        - fraud_risk_score: Number 0-100
+        - identity_misuse_flag: Boolean
+        - reasons: List of strings
+        
+    Raises:
+        ValueError: If patient not found or analysis fails
+        Exception: For unexpected errors
+    """
+    try:
+        return asyncio.run(analyze_agent1_only_async(patient_id))
+    finally:
+        # Clean up any pending async tasks
+        try:
+            loop = asyncio.get_event_loop()
+            if not loop.is_closed():
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+        except:
+            pass
+
+async def analyze_agent1_only_async(patient_id: str) -> Dict[str, Any]:
+    """
+    Async implementation of analyze_agent1_only.
+    """
+    start_time = time.time()
+    logger.info(f"Starting Agent 1 analysis for patient: {patient_id}")
+    
+    try:
+        # Create prompt that instructs agent to use the tool
+        prompt = f"""Analyze patient {patient_id} for fraud and identity misuse.
+
+First, use the fetch_patient_data_tool to retrieve the patient's data.
+Then analyze the data for fraud patterns and return the results in the required JSON format."""
+
+        # Create session first
+        session = session_service.create_session_sync(
+            app_name="identity_agent",
+            user_id=f"user_{patient_id}",
+            session_id=f"session_{patient_id}"
+        )
+        
+        # Run the identity agent using Runner
+        # Create Content with the prompt
+        message_content = types.Content(
+            parts=[types.Part(text=prompt)],
+            role="user"
+        )
+        response_events = []
+        async for event in identity_runner.run_async(
+            user_id=f"user_{patient_id}",
+            session_id=f"session_{patient_id}",
+            new_message=message_content
+        ):
+            response_events.append(event)
+        
+        # Extract response from events - find final response event
+        final_response_event = None
+        for event in response_events:
+            if hasattr(event, 'is_final_response') and event.is_final_response():
+                final_response_event = event
+                break
+        if final_response_event is None and response_events:
+            final_response_event = response_events[-1]
+        
+        # Debug: log event structure
+        if final_response_event:
+            logger.debug(f"Final event type: {type(final_response_event)}")
+            logger.debug(f"Final event has content: {hasattr(final_response_event, 'content')}")
+            if hasattr(final_response_event, 'content'):
+                logger.debug(f"Content type: {type(final_response_event.content)}, length: {len(final_response_event.content) if isinstance(final_response_event.content, list) else 'N/A'}")
+        
+        # Extract the response content - try multiple approaches
+        content = parse_agent_response(final_response_event)
+        
+        # If content is empty, try extracting from all events
+        if not content or not content.strip():
+            logger.info("Content empty from final event, trying all events...")
+            all_text = []
+            for i, event in enumerate(response_events):
+                if hasattr(event, 'content') and event.content:
+                    content_list = event.content if isinstance(event.content, list) else [event.content]
+                    for content_item in content_list:
+                        if hasattr(content_item, 'parts') and content_item.parts:
+                            for part in content_item.parts:
+                                # Check for text attribute - this is the key
+                                if hasattr(part, 'text') and part.text and part.text.strip():
+                                    all_text.append(part.text.strip())
+                                    logger.debug(f"Event {i}: Found text part ({len(part.text)} chars)")
+            if all_text:
+                # Join all text parts
+                content = " ".join(all_text)
+                logger.info(f"Extracted content from all events: {len(content)} chars")
+            else:
+                logger.warning("No text found in any event parts")
+        
+        if not content or not content.strip():
+            # Log the event structure for debugging
+            logger.error(f"No content extracted. Event structure: {[type(e).__name__ for e in response_events]}")
+            raise ValueError("No content extracted from agent response. Agent may not have returned text.")
+        
+        content = clean_json_response(content)
+        
+        # Parse JSON
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error. Content was: {content[:200]}")
+            raise
+        
+        # Validate output structure
+        validate_identity_result(result)
+        
+        duration = (time.time() - start_time) * 1000
+        logger.info(f"Agent 1 analysis complete: duration={duration:.2f}ms, fraud_score={result['fraud_risk_score']}, identity_misuse={result['identity_misuse_flag']}")
+        
+        return result
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing error: {str(e)}")
+        raise ValueError(f"Failed to parse agent response as JSON: {str(e)}")
+    except ValueError as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise
+    except Exception as e:
+        duration = (time.time() - start_time) * 1000
+        logger.error(f"Unexpected error during Agent 1 analysis: {str(e)}, duration={duration:.2f}ms", exc_info=True)
+        raise Exception(f"Error analyzing patient: {str(e)}")
+
+def fetch_patient_data(patient_id: str) -> Dict[str, Any]:
+    """
+    Fetch patient data (backward compatibility wrapper for API server).
+    
+    Args:
+        patient_id: Patient UUID
+        
+    Returns:
+        Dictionary with patient, claims, and claim_lines
+    """
+    return fetch_patient_data_direct(patient_id)
+
+def get_sample_patient_ids(limit: int = 10) -> list:
     """Get sample patient IDs for testing"""
     return patients.index.tolist()[:limit]
 
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
 if __name__ == "__main__":
-    import sys
-    
-    print("🏥 MediGuard AI Agent - Starting Analysis...")
+    print("MediGuard AI Agent (ADK) - Starting Analysis...")
     
     # Get patient ID from command line or prompt
     if len(sys.argv) > 1:
@@ -303,28 +635,28 @@ if __name__ == "__main__":
     else:
         # Show sample patient IDs
         sample_ids = get_sample_patient_ids(5)
-        print(f"\n📋 Sample Patient IDs (first 5):")
+        print(f"\nSample Patient IDs (first 5):")
         for i, pid in enumerate(sample_ids, 1):
             print(f"  {i}. {pid}")
         
         patient_id = input("\nEnter Patient ID (UUID): ").strip()
         if not patient_id:
-            print("❌ No patient ID provided. Exiting.")
+            print("ERROR: No patient ID provided. Exiting.")
             sys.exit(1)
     
-    print(f"\n📋 Analyzing Patient: {patient_id}\n")
+        print(f"\nAnalyzing Patient: {patient_id}\n")
     
     try:
-        # For now, run Agent 1 only (as per plan focus)
+        # Run Agent 1 only
         result = analyze_agent1_only(patient_id)
         
         print("=" * 60)
-        print("📊 AGENT 1 ANALYSIS RESULTS (Claims & Identity Fraud)")
+        print("AGENT 1 ANALYSIS RESULTS (Claims & Identity Fraud)")
         print("=" * 60)
         print(json.dumps(result, indent=2))
     except ValueError as e:
-        print(f"❌ Error: {str(e)}")
+        print(f"ERROR: {str(e)}")
         sys.exit(1)
     except Exception as e:
-        print(f"❌ Unexpected error: {str(e)}")
+        print(f"ERROR: Unexpected error: {str(e)}")
         sys.exit(1)

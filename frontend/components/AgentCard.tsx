@@ -59,19 +59,6 @@ export default function AgentCard({ title, icon, data, isLoading }: AgentCardPro
           </div>
         )}
 
-        {data.unnecessary_procedure_flag !== undefined && (
-          <div className="flex items-center space-x-2">
-            <span className="text-sm font-medium text-gray-700">Unnecessary Procedures:</span>
-            <span className={`px-2 py-1 rounded text-xs font-medium ${
-              data.unnecessary_procedure_flag 
-                ? 'bg-danger/10 text-danger' 
-                : 'bg-success/10 text-success'
-            }`}>
-              {data.unnecessary_procedure_flag ? 'Detected' : 'Not Detected'}
-            </span>
-          </div>
-        )}
-
         {data.discharge_ready !== undefined && (
           <div className="flex items-center space-x-2">
             <span className="text-sm font-medium text-gray-700">Discharge Ready:</span>
