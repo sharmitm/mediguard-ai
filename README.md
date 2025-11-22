@@ -172,15 +172,32 @@ curl http://localhost:8000/api/sample-ids
 
 ## 🏗️ Architecture
 
+### System Architecture
+
+![System Architecture](img/SYSTEM-ARCHITECTURE.png)
+
+The system follows a **layered architecture** with clear separation of concerns:
+
+- **Frontend Layer** - Next.js application with React components (Port 3000)
+- **API Layer** - FastAPI REST API server (Port 8000)
+- **Agent Orchestration** - SequentialAgent managing three specialized LlmAgents
+- **Tool Layer** - Custom ADK FunctionTools for data access and analysis
+- **Data Layer** - In-memory Pandas DataFrames loaded from CSV files
+- **External Services** - Google Gemini API for LLM inference
+
 ### Agent Workflow
+
+![Agent Workflow](img/agent-workflow.png)
 
 The system uses a **sequential workflow** where agents run one after another:
 
-1. **Identity Agent** → Analyzes patient data for fraud patterns
+1. **Identity Agent** → Analyzes patient data for fraud patterns using multiple tools
 2. **Billing Agent** → Uses identity results to assess billing fraud
 3. **Discharge Agent** → (Currently disabled) Uses both results for discharge assessment
 
-![Results Display](img/results-all-agents.png)
+Each agent makes tool calls to access data, then performs LLM analysis via Gemini API before passing results to the next agent.
+
+**📖 For detailed architecture documentation, see [Architecture Documentation](docs/ARCHITECTURE.md)**
 
 ### Technology Stack
 
@@ -199,6 +216,7 @@ The system uses a **sequential workflow** where agents run one after another:
 
 ## 📚 Documentation
 
+- **[Architecture Documentation](docs/ARCHITECTURE.md)** - Comprehensive system architecture, diagrams, and design decisions
 - **[Backend Documentation](docs/BACKEND.md)** - Detailed explanation of all backend functions, agents, and tools
 - **[Frontend Documentation](docs/FRONTEND.md)** - Component and function documentation
 - **[Synthea Data Mapping](docs/synthea-data-mapping.md)** - Data structure requirements
