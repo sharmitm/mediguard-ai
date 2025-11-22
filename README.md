@@ -197,7 +197,7 @@ The system uses a **sequential workflow** where agents run one after another:
 
 Each agent makes tool calls to access data, then performs LLM analysis via Gemini API before passing results to the next agent.
 
-**📖 For detailed architecture documentation, see [Architecture Documentation](docs/ARCHITECTURE.md)**
+**📖 For detailed architecture documentation, see [Architecture Documentation](docs/architecture.md)**
 
 ### Technology Stack
 
