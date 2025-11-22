@@ -187,7 +187,7 @@ The system follows a **layered architecture** with clear separation of concerns:
 
 ### Agent Workflow
 
-![Agent Workflow](img/agent-workflow.png)
+<img src="img/agent-workflow.png" alt="Agent Workflow" style="max-width: 100%; max-height: 400px; width: auto; height: auto;" />
 
 The system uses a **sequential workflow** where agents run one after another:
 
