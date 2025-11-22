@@ -7,6 +7,37 @@ Healthcare fraud detection and discharge management system using LangGraph and G
 - Billing Fraud Analysis
 - Discharge Readiness Assessment
 
+##  Agent 3 – **Discharge Readiness Agent**
+
+### **Purpose**
+The Discharge Readiness Agent assesses a patient's pending responsibilities and looks for anything that could cause a delay in discharge.  
+ It employs LLM reasoning to comprehend task descriptions, identify bottlenecks, and predict the projected delay.
+
+### **What It Checks**
+- Pending lab tests
+- Pending imaging or scans
+- Missing specialist consultations
+- Incomplete or pending tasks
+- Any discharge-blocking instructions in the patient case
+
+### **Input**
+The agent receives:
+- Patient’s task list  
+(from the synthetic data in `patients.csv`)
+
+### **Output (JSON)**
+The agent returns structured JSON:
+```json
+{
+  "discharge_ready": true/false,
+  "blockers": ["list of reasons"],
+  "delay_hours": <number>,
+  "priority_level": "LOW" | "MEDIUM" | "HIGH"
+}
+
+
+
+To identify clinical and administrative blockers that prevent a patient from being safely discharged.
 ## Setup
 
 1. Clone the repository
