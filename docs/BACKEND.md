@@ -152,13 +152,23 @@ This document explains all functions and components in the MediGuard AI backend 
 **Purpose:** Agent 3 - Assesses discharge readiness and identifies blockers using Google ADK.
 
 **What it does:**
-1. Uses ADK `LlmAgent` (no tools currently)
-2. Receives tasks/blockers information
-3. LLM determines:
+1. Uses ADK `LlmAgent` with discharge assessment tools
+2. Receives identity and billing analysis results
+3. Uses tools to:
+   - Check for active inpatient encounters (`get_active_encounters`)
+   - Find pending procedures (`get_pending_procedures`)
+   - Check fraud-related discharge blockers (`check_discharge_readiness`)
+4. LLM determines:
    - If patient is ready for discharge
-   - What blockers exist (pending labs, scans, paperwork)
-   - Estimated delay hours
-4. Returns JSON with discharge assessment
+   - What blockers exist (pending labs, scans, consults, fraud investigations)
+   - Estimated delay hours based on blocker types
+5. Returns JSON with discharge assessment
+
+**Tools Available:**
+- `get_active_encounters` - Checks for active inpatient encounters
+- `get_pending_procedures` - Finds pending labs, scans, consults
+- `check_discharge_readiness` - Checks if fraud blocks discharge
+- `fetch_patient_data_tool` - Retrieves patient data
 
 **Output Format:**
 ```python

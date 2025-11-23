@@ -8,6 +8,7 @@ import sys
 import logging
 import time
 import asyncio
+import uuid
 from typing import Dict, Any
 import pandas as pd
 from dotenv import load_dotenv
@@ -25,6 +26,9 @@ from tools_adk import (
     calculate_claim_statistics,
     check_patient_consistency,
     analyze_diagnosis_procedure_match,
+    get_active_encounters,
+    get_pending_procedures,
+    check_discharge_readiness,
     initialize_tools_data
 )
 
@@ -45,14 +49,34 @@ def load_all_data():
     patients_df = pd.read_csv(f"{data_dir}/patients.csv").set_index("Id")
     claims_df = pd.read_csv(f"{data_dir}/claims.csv")
     claim_lines_df = pd.read_csv(f"{data_dir}/claim_lines.csv")
-    return patients_df, claims_df, claim_lines_df
+    
+    # Load encounters and procedures if available
+    encounters_df = None
+    procedures_df = None
+    try:
+        encounters_df = pd.read_csv(f"{data_dir}/encounters.csv")
+        logger.info(f"Loaded encounters: {len(encounters_df)} records")
+    except FileNotFoundError:
+        logger.warning("encounters.csv not found, will use claims data for encounters")
+    except Exception as e:
+        logger.warning(f"Error loading encounters.csv: {e}")
+    
+    try:
+        procedures_df = pd.read_csv(f"{data_dir}/procedures.csv")
+        logger.info(f"Loaded procedures: {len(procedures_df)} records")
+    except FileNotFoundError:
+        logger.warning("procedures.csv not found")
+    except Exception as e:
+        logger.warning(f"Error loading procedures.csv: {e}")
+    
+    return patients_df, claims_df, claim_lines_df, encounters_df, procedures_df
 
 # Load data at startup
-patients, claims, claim_lines = load_all_data()
+patients, claims, claim_lines, encounters, procedures = load_all_data()
 logger.info(f"Loaded data: {len(patients)} patients, {len(claims)} claims, {len(claim_lines)} claim lines")
 
 # Initialize tools with data
-initialize_tools_data(patients, claims, claim_lines)
+initialize_tools_data(patients, claims, claim_lines, encounters, procedures)
 
 # Initialize Gemini model
 model = Gemini(
@@ -87,6 +111,7 @@ You MUST:
    - Patterns commonly associated with identity misuse (multiple claims with different patient details, rapid claim sequences, etc.)
 3. Use calculate_claim_statistics tool to get statistical insights
 4. Use check_patient_consistency tool to verify data consistency
+5. AFTER using the tools, you MUST provide your analysis result as text
 
 You MUST respond with ONLY valid JSON in this exact format:
 {
@@ -94,6 +119,8 @@ You MUST respond with ONLY valid JSON in this exact format:
     "identity_misuse_flag": <boolean>,
     "reasons": [<array of strings>]
 }
+
+IMPORTANT: After calling any tools, you MUST provide your final answer as text. Do NOT stop after calling tools - always provide the JSON response.
 
 Do NOT include markdown code blocks, explanations, or any text outside the JSON object.
 Return ONLY the raw JSON object.
@@ -142,29 +169,56 @@ Example output:
 discharge_agent = LlmAgent(
     name="discharge_agent",
     model=model,
-    tools=[],
+    tools=[
+        get_active_encounters,
+        get_pending_procedures,
+        check_discharge_readiness,
+        fetch_patient_data_tool
+    ],
     instruction="""You are MediGuard Discharge Agent.
 
-Your role is to assess discharge readiness and identify blockers.
+Your role is to assess discharge readiness and identify blockers that prevent patient discharge.
 
 You MUST:
-1. Review the tasks/blockers provided
-2. Determine if patient is ready for discharge
-3. Identify what blockers exist (pending labs, scans, paperwork, etc.)
-4. Estimate delay hours if not ready
+1. Use get_active_encounters tool to check if patient has an active inpatient encounter
+2. If patient has active encounter, use get_pending_procedures tool to find pending procedures
+3. Use check_discharge_readiness tool to check if fraud analysis blocks discharge
+4. Analyze all blockers:
+   - Pending labs (blood tests, cultures, etc.)
+   - Pending scans (imaging studies, X-rays, CT scans, etc.)
+   - Pending consults (specialist consultations, referrals)
+   - Fraud-related blockers (if identity/billing fraud detected)
+5. Determine if patient is ready for discharge
+6. Estimate delay hours based on blockers:
+   - Labs: 4-8 hours
+   - Scans: 2-6 hours
+   - Consults: 4-24 hours
+   - Fraud investigation: 24-48 hours
+   - Multiple blockers: sum of individual delays
+
+CRITICAL INSTRUCTIONS: 
+- If patient has no active encounter, they are ready for discharge
+- If fraud blocker exists, discharge is NOT ready
+- If no blockers exist, patient is ready for discharge
+- AFTER calling ANY tools, you MUST ALWAYS provide your final answer as TEXT. 
+- Do NOT stop after calling tools - you MUST provide the JSON response as text.
+- Even if tools return all the information you need, you MUST still output your analysis as text JSON.
+- The workflow requires a text response - function calls alone are not sufficient.
 
 You MUST respond with ONLY valid JSON in this exact format:
 {
     "discharge_ready": <boolean>,
-    "blockers": [<array of strings>],
-    "delay_hours": <number>
+    "blockers": [<array of strings describing blockers>],
+    "delay_hours": <number - estimated hours until discharge ready>
 }
 
 Do NOT include markdown code blocks, explanations, or any text outside the JSON object.
 Return ONLY the raw JSON object.
 
-Example output:
-{"discharge_ready": true, "blockers": [], "delay_hours": 0}"""
+Example outputs:
+{"discharge_ready": true, "blockers": [], "delay_hours": 0}
+{"discharge_ready": false, "blockers": ["Pending blood lab results", "CT scan scheduled"], "delay_hours": 8}
+{"discharge_ready": false, "blockers": ["Identity fraud investigation required"], "delay_hours": 36}"""
 )
 
 # Create Sequential workflow (replaces StateGraph)
@@ -184,6 +238,11 @@ runner = Runner(
 identity_runner = Runner(
     agent=identity_agent,
     app_name="identity_agent",
+    session_service=session_service
+)
+discharge_runner = Runner(
+    agent=discharge_agent,
+    app_name="discharge_agent",
     session_service=session_service
 )
 
@@ -333,10 +392,15 @@ async def analyze_patient_async(patient_id: str) -> Dict[str, Any]:
         
         # Step 1: Run identity agent
         logger.info(f"Step 1: Running identity agent for patient {patient_id}")
+        
+        # Use unique session IDs to avoid conflicts between requests
+        session_suffix = str(uuid.uuid4())[:8]  # Short unique ID
+        identity_session_id = f"session_{patient_id}_identity_{session_suffix}"
+        
         identity_session = session_service.create_session_sync(
             app_name="identity_agent",
             user_id=f"user_{patient_id}",
-            session_id=f"session_{patient_id}_identity"
+            session_id=identity_session_id
         )
         
         # Run identity agent separately to get its result
@@ -348,29 +412,89 @@ async def analyze_patient_async(patient_id: str) -> Dict[str, Any]:
         identity_events = []
         async for event in identity_runner.run_async(
             user_id=f"user_{patient_id}",
-            session_id=f"session_{patient_id}_identity",
+            session_id=identity_session_id,
             new_message=identity_message
         ):
             identity_events.append(event)
-        identity_response = identity_events[-1] if identity_events else None
-        identity_content = parse_agent_response(identity_response)
-        if not identity_content or not identity_content.strip():
-            # Try extracting from all events if single event failed
-            logger.warning(f"Failed to extract from last event, trying all {len(identity_events)} events")
-            all_text = []
+            # Log event details for debugging
+            event_type = event.__class__.__name__ if hasattr(event, '__class__') else str(type(event))
+            logger.debug(f"Identity event {len(identity_events)}: {event_type}")
+            if hasattr(event, 'content') and event.content:
+                logger.debug(f"  Event has content: {type(event.content)}")
+        
+        logger.info(f"Identity agent completed with {len(identity_events)} events")
+        
+        # If last event has None content, agent may need a follow-up to generate response
+        # Check if we have events and the last one has None or empty content
+        needs_followup = False
+        if identity_events:
+            last_event = identity_events[-1]
+            if hasattr(last_event, 'content'):
+                if last_event.content is None:
+                    needs_followup = True
+                elif isinstance(last_event.content, list) and len(last_event.content) == 0:
+                    needs_followup = True
+        
+        if needs_followup:
+            logger.warning("Last event has None content - sending follow-up to get JSON response")
+            followup_message = types.Content(
+                parts=[types.Part(text="Please provide your analysis result as JSON. Return ONLY the JSON object with fraud_risk_score, identity_misuse_flag, and reasons fields. Do not include markdown or explanations.")],
+                role="user"
+            )
+            followup_events = []
+            async for event in identity_runner.run_async(
+                user_id=f"user_{patient_id}",
+                session_id=identity_session_id,
+                new_message=followup_message
+            ):
+                followup_events.append(event)
+                logger.debug(f"Followup identity event {len(followup_events)}: {type(event).__name__}")
+            
+            # Add followup events to the main list
+            identity_events.extend(followup_events)
+            logger.info(f"Added {len(followup_events)} followup events. Total events: {len(identity_events)}")
+        
+        # Try to extract response from events, prioritizing model response events
+        identity_content = None
+        all_text = []
+        
+        # First, try to find a model response event (after function calls)
+        # Iterate in reverse to get the most recent response first
+        for i, event in enumerate(reversed(identity_events)):
+            if hasattr(event, 'content') and event.content:
+                content_list = event.content if isinstance(event.content, list) else [event.content]
+                for content_item in content_list:
+                    if content_item and hasattr(content_item, 'parts') and content_item.parts:
+                        for part in content_item.parts:
+                            # Look for text parts (skip function_call parts)
+                            if hasattr(part, 'text') and part.text:
+                                text = str(part.text).strip()
+                                if text:
+                                    logger.debug(f"Found text in event {len(identity_events) - i - 1}: {text[:100]}...")
+                                    all_text.append(text)
+                                    if not identity_content:  # Use first non-empty text found
+                                        identity_content = text
+        
+        # If we found text, join it all
+        if all_text:
+            identity_content = " ".join(all_text)
+            logger.info(f"Extracted identity content from events: {len(identity_content)} chars")
+        elif identity_events:
+            # If no text found, log detailed event information for debugging
+            logger.error(f"Identity agent returned no text content. Event count: {len(identity_events)}")
             for i, event in enumerate(identity_events):
-                if hasattr(event, 'content') and event.content:
-                    content_list = event.content if isinstance(event.content, list) else [event.content]
-                    for content_item in content_list:
-                        if content_item and hasattr(content_item, 'parts') and content_item.parts:
-                            for part in content_item.parts:
-                                if hasattr(part, 'text') and part.text:
-                                    all_text.append(str(part.text).strip())
-            if all_text:
-                identity_content = " ".join(all_text)
-                logger.info(f"Extracted identity content from all events: {len(identity_content)} chars")
-            else:
-                raise ValueError(f"Identity agent returned empty response. Events: {len(identity_events)}")
+                event_type = type(event).__name__ if hasattr(type(event), '__name__') else str(type(event))
+                logger.error(f"Event {i}: type={event_type}, has content={hasattr(event, 'content')}")
+                if hasattr(event, 'content'):
+                    logger.error(f"  Content type: {type(event.content)}, value: {event.content}")
+                    if event.content and isinstance(event.content, list):
+                        for j, content_item in enumerate(event.content):
+                            logger.error(f"    Content item {j}: {type(content_item)}")
+                            if content_item and hasattr(content_item, 'parts'):
+                                logger.error(f"      Parts: {content_item.parts}")
+            raise ValueError(f"Identity agent returned empty response. Events: {len(identity_events)}")
+        else:
+            raise ValueError("Identity agent returned no events")
         identity_content = clean_json_response(identity_content)
         logger.info(f"Identity agent response length: {len(identity_content)} chars, preview: {identity_content[:200]}")
         identity_result = json.loads(identity_content)
@@ -379,11 +503,12 @@ async def analyze_patient_async(patient_id: str) -> Dict[str, Any]:
         
         # Step 2: Run billing agent with identity result
         logger.info(f"Step 2: Running billing agent for patient {patient_id}")
-        # Create session for billing agent
+        # Create session for billing agent with unique ID
+        billing_session_id = f"session_{patient_id}_billing_{session_suffix}"
         billing_session = session_service.create_session_sync(
             app_name="billing_agent",
             user_id=f"user_{patient_id}",
-            session_id=f"session_{patient_id}_billing"
+            session_id=billing_session_id
         )
         
         # Run billing agent with identity result
@@ -396,44 +521,210 @@ async def analyze_patient_async(patient_id: str) -> Dict[str, Any]:
         billing_events = []
         async for event in billing_runner.run_async(
             user_id=f"user_{patient_id}",
-            session_id=f"session_{patient_id}_billing",
+            session_id=billing_session_id,
             new_message=billing_message
         ):
             billing_events.append(event)
-        billing_response = billing_events[-1] if billing_events else None
-        billing_content = parse_agent_response(billing_response)
-        if not billing_content or not billing_content.strip():
-            # Try extracting from all events if single event failed
-            logger.warning(f"Failed to extract from last event, trying all {len(billing_events)} events")
-            all_text = []
+            # Log event details for debugging
+            event_type = event.__class__.__name__ if hasattr(event, '__class__') else str(type(event))
+            logger.debug(f"Billing event {len(billing_events)}: {event_type}")
+            if hasattr(event, 'content') and event.content:
+                logger.debug(f"  Event has content: {type(event.content)}")
+        
+        logger.info(f"Billing agent completed with {len(billing_events)} events")
+        
+        # If last event has None content, agent may need a follow-up to generate response
+        needs_followup = False
+        if billing_events:
+            last_event = billing_events[-1]
+            if hasattr(last_event, 'content'):
+                if last_event.content is None:
+                    needs_followup = True
+                elif isinstance(last_event.content, list) and len(last_event.content) == 0:
+                    needs_followup = True
+        
+        if needs_followup:
+            logger.warning("Last billing event has None content - sending follow-up to get JSON response")
+            followup_message = types.Content(
+                parts=[types.Part(text="Please provide your analysis result as JSON. Return ONLY the JSON object with billing_risk_score, billing_flags, and billing_explanation fields. Do not include markdown or explanations.")],
+                role="user"
+            )
+            followup_events = []
+            async for event in billing_runner.run_async(
+                user_id=f"user_{patient_id}",
+                session_id=billing_session_id,
+                new_message=followup_message
+            ):
+                followup_events.append(event)
+                logger.debug(f"Followup billing event {len(followup_events)}: {type(event).__name__}")
+            
+            # Add followup events to the main list
+            billing_events.extend(followup_events)
+            logger.info(f"Added {len(followup_events)} followup events. Total events: {len(billing_events)}")
+        
+        # Try to extract response from events, prioritizing model response events
+        billing_content = None
+        all_text = []
+        
+        # First, try to find a model response event (after function calls)
+        # Iterate in reverse to get the most recent response first
+        for i, event in enumerate(reversed(billing_events)):
+            if hasattr(event, 'content') and event.content:
+                content_list = event.content if isinstance(event.content, list) else [event.content]
+                for content_item in content_list:
+                    if content_item and hasattr(content_item, 'parts') and content_item.parts:
+                        for part in content_item.parts:
+                            # Look for text parts (skip function_call parts)
+                            if hasattr(part, 'text') and part.text:
+                                text = str(part.text).strip()
+                                if text:
+                                    logger.debug(f"Found text in billing event {len(billing_events) - i - 1}: {text[:100]}...")
+                                    all_text.append(text)
+                                    if not billing_content:  # Use first non-empty text found
+                                        billing_content = text
+        
+        # If we found text, join it all
+        if all_text:
+            billing_content = " ".join(all_text)
+            logger.info(f"Extracted billing content from events: {len(billing_content)} chars")
+        elif billing_events:
+            # If no text found, log detailed event information for debugging
+            logger.error(f"Billing agent returned no text content. Event count: {len(billing_events)}")
             for i, event in enumerate(billing_events):
-                if hasattr(event, 'content') and event.content:
-                    content_list = event.content if isinstance(event.content, list) else [event.content]
-                    for content_item in content_list:
-                        if content_item and hasattr(content_item, 'parts') and content_item.parts:
-                            for part in content_item.parts:
-                                if hasattr(part, 'text') and part.text:
-                                    all_text.append(str(part.text).strip())
-            if all_text:
-                billing_content = " ".join(all_text)
-                logger.info(f"Extracted billing content from all events: {len(billing_content)} chars")
-            else:
-                raise ValueError(f"Billing agent returned empty response. Events: {len(billing_events)}")
+                event_type = type(event).__name__ if hasattr(type(event), '__name__') else str(type(event))
+                logger.error(f"Event {i}: type={event_type}, has content={hasattr(event, 'content')}")
+                if hasattr(event, 'content'):
+                    logger.error(f"  Content type: {type(event.content)}, value: {event.content}")
+                    if event.content and isinstance(event.content, list):
+                        for j, content_item in enumerate(event.content):
+                            logger.error(f"    Content item {j}: {type(content_item)}")
+                            if content_item and hasattr(content_item, 'parts'):
+                                logger.error(f"      Parts: {content_item.parts}")
+            raise ValueError(f"Billing agent returned empty response. Events: {len(billing_events)}")
+        else:
+            raise ValueError("Billing agent returned no events")
         billing_content = clean_json_response(billing_content)
         logger.info(f"Billing agent response length: {len(billing_content)} chars, preview: {billing_content[:200]}")
         billing_result = json.loads(billing_content)
         validate_billing_result(billing_result)
         logger.info(f"Step 2 complete: Billing agent risk_score={billing_result.get('billing_risk_score', 0)}")
         
-        # Step 3: Discharge agent - DISABLED (waiting for teammate's implementation)
-        logger.info(f"Step 3: Discharge agent skipped - waiting for implementation")
-        # Return default/empty discharge result without running the agent
-        discharge_result = {
-            "discharge_ready": True,  # Default to ready
-            "blockers": [],  # No blockers
-            "delay_hours": 0  # No delay
-        }
-        logger.info(f"Step 3 complete: Discharge agent skipped - using default values")
+        # Step 3: Run discharge agent with identity and billing results
+        logger.info(f"Step 3: Running discharge agent for patient {patient_id}")
+        
+        # Create session for discharge agent with unique ID
+        discharge_session_id = f"session_{patient_id}_discharge_{session_suffix}"
+        discharge_session = session_service.create_session_sync(
+            app_name="discharge_agent",
+            user_id=f"user_{patient_id}",
+            session_id=discharge_session_id
+        )
+        
+        # Run discharge agent with identity and billing results
+        discharge_prompt = f"""Assess discharge readiness for patient {patient_id}.
+
+Identity Analysis Results: {json.dumps(identity_result)}
+Billing Analysis Results: {json.dumps(billing_result)}
+
+Use the tools to check for active encounters, pending procedures, and fraud blockers.
+Determine if patient is ready for discharge and identify any blockers."""
+
+        discharge_message = types.Content(
+            parts=[types.Part(text=discharge_prompt)],
+            role="user"
+        )
+        
+        discharge_events = []
+        async for event in discharge_runner.run_async(
+            user_id=f"user_{patient_id}",
+            session_id=discharge_session_id,
+            new_message=discharge_message
+        ):
+            discharge_events.append(event)
+            # Log event details for debugging
+            event_type = event.__class__.__name__ if hasattr(event, '__class__') else str(type(event))
+            logger.debug(f"Discharge event {len(discharge_events)}: {event_type}")
+            if hasattr(event, 'content') and event.content:
+                logger.debug(f"  Event has content: {type(event.content)}")
+        
+        logger.info(f"Discharge agent completed with {len(discharge_events)} events")
+        
+        # If last event has None content, agent may need a follow-up to generate response
+        needs_followup = False
+        if discharge_events:
+            last_event = discharge_events[-1]
+            if hasattr(last_event, 'content'):
+                if last_event.content is None:
+                    needs_followup = True
+                elif isinstance(last_event.content, list) and len(last_event.content) == 0:
+                    needs_followup = True
+        
+        if needs_followup:
+            logger.warning("Last discharge event has None content - sending follow-up to get JSON response")
+            followup_message = types.Content(
+                parts=[types.Part(text="Please provide your analysis result as JSON. Return ONLY the JSON object with discharge_ready, blockers, and delay_hours fields. Do not include markdown or explanations.")],
+                role="user"
+            )
+            followup_events = []
+            async for event in discharge_runner.run_async(
+                user_id=f"user_{patient_id}",
+                session_id=discharge_session_id,
+                new_message=followup_message
+            ):
+                followup_events.append(event)
+                logger.debug(f"Followup discharge event {len(followup_events)}: {type(event).__name__}")
+            
+            # Add followup events to the main list
+            discharge_events.extend(followup_events)
+            logger.info(f"Added {len(followup_events)} followup events. Total events: {len(discharge_events)}")
+        
+        # Try to extract response from events, prioritizing model response events
+        discharge_content = None
+        all_text = []
+        
+        # First, try to find a model response event (after function calls)
+        # Iterate in reverse to get the most recent response first
+        for i, event in enumerate(reversed(discharge_events)):
+            if hasattr(event, 'content') and event.content:
+                content_list = event.content if isinstance(event.content, list) else [event.content]
+                for content_item in content_list:
+                    if content_item and hasattr(content_item, 'parts') and content_item.parts:
+                        for part in content_item.parts:
+                            # Look for text parts (skip function_call parts)
+                            if hasattr(part, 'text') and part.text:
+                                text = str(part.text).strip()
+                                if text:
+                                    logger.debug(f"Found text in discharge event {len(discharge_events) - i - 1}: {text[:100]}...")
+                                    all_text.append(text)
+                                    if not discharge_content:  # Use first non-empty text found
+                                        discharge_content = text
+        
+        # If we found text, join it all
+        if all_text:
+            discharge_content = " ".join(all_text)
+            logger.info(f"Extracted discharge content from events: {len(discharge_content)} chars")
+        elif discharge_events:
+            # If no text found, log detailed event information for debugging
+            logger.error(f"Discharge agent returned no text content. Event count: {len(discharge_events)}")
+            for i, event in enumerate(discharge_events):
+                event_type = type(event).__name__ if hasattr(type(event), '__name__') else str(type(event))
+                logger.error(f"Event {i}: type={event_type}, has content={hasattr(event, 'content')}")
+                if hasattr(event, 'content'):
+                    logger.error(f"  Content type: {type(event.content)}, value: {event.content}")
+                    if event.content and isinstance(event.content, list):
+                        for j, content_item in enumerate(event.content):
+                            logger.error(f"    Content item {j}: {type(content_item)}")
+                            if content_item and hasattr(content_item, 'parts'):
+                                logger.error(f"      Parts: {content_item.parts}")
+            raise ValueError(f"Discharge agent returned empty response. Events: {len(discharge_events)}")
+        else:
+            raise ValueError("Discharge agent returned no events")
+        
+        discharge_content = clean_json_response(discharge_content)
+        logger.info(f"Discharge agent response length: {len(discharge_content)} chars, preview: {discharge_content[:200]}")
+        discharge_result = json.loads(discharge_content)
+        validate_discharge_result(discharge_result)
+        logger.info(f"Step 3 complete: Discharge agent - ready={discharge_result.get('discharge_ready', False)}, blockers={len(discharge_result.get('blockers', []))}")
         
         # Get raw data for final result
         raw_data = fetch_patient_data_direct(patient_id)

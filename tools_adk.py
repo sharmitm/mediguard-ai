@@ -3,9 +3,10 @@ ADK Tools for MediGuard AI
 Custom FunctionTools for Google ADK agents
 """
 import pandas as pd
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from google.adk.tools import FunctionTool
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -13,13 +14,17 @@ logger = logging.getLogger(__name__)
 patients = None
 claims = None
 claim_lines = None
+encounters = None
+procedures = None
 
-def initialize_tools_data(patients_df, claims_df, claim_lines_df):
+def initialize_tools_data(patients_df, claims_df, claim_lines_df, encounters_df=None, procedures_df=None):
     """Initialize global dataframes for tools"""
-    global patients, claims, claim_lines
+    global patients, claims, claim_lines, encounters, procedures
     patients = patients_df
     claims = claims_df
     claim_lines = claim_lines_df
+    encounters = encounters_df
+    procedures = procedures_df
     logger.info("Tools data initialized")
 
 def to_native_type(val):
@@ -324,4 +329,264 @@ def analyze_diagnosis_procedure_match(diagnosis_code: str, procedure_codes: List
     
     logger.info(f"Match analysis: {matches} matches, {len(mismatches)} mismatches")
     return result
+
+@FunctionTool
+def get_active_encounters(patient_id: str) -> Dict[str, Any]:
+    """
+    Get active encounters for a patient (inpatient encounters without discharge date).
+    
+    This tool identifies if a patient is currently admitted and needs discharge assessment.
+    
+    Args:
+        patient_id: Patient UUID
+        
+    Returns:
+        Dictionary containing:
+        - has_active_encounter: Boolean indicating if patient has active inpatient encounter
+        - active_encounters: List of active encounter details
+        - admission_date: Most recent admission date if any
+        - encounter_class: Type of encounter (inpatient, ambulatory, etc.)
+    """
+    logger.info(f"Checking active encounters for patient: {patient_id}")
+    
+    if encounters is None:
+        # Fallback to claims if encounters not available
+        if claims is None:
+            return {
+                "has_active_encounter": False,
+                "active_encounters": [],
+                "admission_date": None,
+                "encounter_class": None
+            }
+        
+        # Check claims for active inpatient encounters
+        patient_claims = claims[claims["patient_id"] == patient_id]
+        now = datetime.now()
+        
+        active_encounters = []
+        for _, claim in patient_claims.iterrows():
+            admission = claim.get("admission_date")
+            discharge = claim.get("discharge_date")
+            enc_class = claim.get("encounter_class", "")
+            
+            # Check if inpatient and not discharged
+            if enc_class == "inpatient":
+                if pd.isna(discharge) or discharge == "":
+                    # No discharge date - still admitted
+                    active_encounters.append({
+                        "encounter_id": str(to_native_type(claim.get("claim_id", ""))),
+                        "admission_date": str(admission) if pd.notna(admission) else None,
+                        "discharge_date": None,
+                        "encounter_class": "inpatient"
+                    })
+                else:
+                    # Check if discharge is in future
+                    try:
+                        discharge_str = str(discharge).replace('Z', '+00:00')
+                        discharge_dt = datetime.fromisoformat(discharge_str)
+                        if discharge_dt > now:
+                            active_encounters.append({
+                                "encounter_id": str(to_native_type(claim.get("claim_id", ""))),
+                                "admission_date": str(admission) if pd.notna(admission) else None,
+                                "discharge_date": str(discharge),
+                                "encounter_class": "inpatient"
+                            })
+                    except Exception as e:
+                        logger.debug(f"Error parsing discharge date: {e}")
+                        pass
+        
+        return {
+            "has_active_encounter": len(active_encounters) > 0,
+            "active_encounters": active_encounters,
+            "admission_date": active_encounters[0]["admission_date"] if active_encounters else None,
+            "encounter_class": "inpatient" if active_encounters else None
+        }
+    
+    # Use encounters dataframe if available
+    patient_encounters = encounters[encounters["PATIENT"] == patient_id]
+    now = datetime.now()
+    
+    active_encounters = []
+    for _, enc in patient_encounters.iterrows():
+        start = enc.get("START")
+        stop = enc.get("STOP")
+        enc_class = enc.get("ENCOUNTERCLASS", "")
+        
+        # Check if inpatient and not stopped
+        if enc_class == "inpatient":
+            if pd.isna(stop) or stop == "":
+                # No stop date - still active
+                active_encounters.append({
+                    "encounter_id": str(to_native_type(enc.get("Id", ""))),
+                    "start_date": str(start) if pd.notna(start) else None,
+                    "stop_date": None,
+                    "encounter_class": "inpatient"
+                })
+            else:
+                # Check if stop is in future
+                try:
+                    stop_str = str(stop).replace('Z', '+00:00')
+                    stop_dt = datetime.fromisoformat(stop_str)
+                    if stop_dt > now:
+                        active_encounters.append({
+                            "encounter_id": str(to_native_type(enc.get("Id", ""))),
+                            "start_date": str(start) if pd.notna(start) else None,
+                            "stop_date": str(stop),
+                            "encounter_class": "inpatient"
+                        })
+                except Exception as e:
+                    logger.debug(f"Error parsing stop date: {e}")
+                    pass
+    
+    return {
+        "has_active_encounter": len(active_encounters) > 0,
+        "active_encounters": active_encounters,
+        "admission_date": active_encounters[0]["start_date"] if active_encounters else None,
+        "encounter_class": "inpatient" if active_encounters else None
+    }
+
+@FunctionTool
+def get_pending_procedures(patient_id: str, encounter_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Get pending procedures for a patient that might block discharge.
+    
+    Identifies procedures like labs, scans, consults that are scheduled or in progress.
+    
+    Args:
+        patient_id: Patient UUID
+        encounter_id: Optional encounter ID to filter procedures
+        
+    Returns:
+        Dictionary containing:
+        - pending_procedures: List of pending procedure details
+        - pending_labs: List of pending lab procedures
+        - pending_scans: List of pending imaging/scans
+        - pending_consults: List of pending consultations
+        - total_pending: Total count of pending procedures
+    """
+    logger.info(f"Checking pending procedures for patient: {patient_id}")
+    
+    if procedures is None:
+        return {
+            "pending_procedures": [],
+            "pending_labs": [],
+            "pending_scans": [],
+            "pending_consults": [],
+            "total_pending": 0
+        }
+    
+    # Filter procedures for this patient
+    patient_procedures = procedures[procedures["PATIENT"] == patient_id]
+    
+    if encounter_id:
+        patient_procedures = patient_procedures[patient_procedures["ENCOUNTER"] == encounter_id]
+    
+    now = datetime.now()
+    pending = []
+    pending_labs = []
+    pending_scans = []
+    pending_consults = []
+    
+    # Keywords to identify procedure types
+    lab_keywords = ["lab", "test", "blood", "urine", "culture", "biopsy", "pathology"]
+    scan_keywords = ["scan", "imaging", "x-ray", "ct", "mri", "ultrasound", "mammography"]
+    consult_keywords = ["consult", "referral", "evaluation", "assessment"]
+    
+    for _, proc in patient_procedures.iterrows():
+        stop = proc.get("STOP")
+        description = str(proc.get("DESCRIPTION", "")).lower()
+        code = str(proc.get("CODE", ""))
+        
+        # Check if procedure is pending (no stop date or stop date in future)
+        is_pending = False
+        if pd.isna(stop) or stop == "":
+            is_pending = True
+        else:
+            try:
+                stop_str = str(stop).replace('Z', '+00:00')
+                stop_dt = datetime.fromisoformat(stop_str)
+                if stop_dt > now:
+                    is_pending = True
+            except Exception as e:
+                logger.debug(f"Error parsing procedure stop date: {e}")
+                pass
+        
+        if is_pending:
+            proc_detail = {
+                "procedure_id": str(to_native_type(proc.get("CODE", ""))),
+                "description": str(to_native_type(proc.get("DESCRIPTION", ""))),
+                "start_date": str(to_native_type(proc.get("START", ""))) if pd.notna(proc.get("START")) else None,
+                "stop_date": str(to_native_type(stop)) if pd.notna(stop) else None,
+                "encounter_id": str(to_native_type(proc.get("ENCOUNTER", ""))) if pd.notna(proc.get("ENCOUNTER")) else None
+            }
+            pending.append(proc_detail)
+            
+            # Categorize by type
+            if any(keyword in description for keyword in lab_keywords):
+                pending_labs.append(proc_detail)
+            elif any(keyword in description for keyword in scan_keywords):
+                pending_scans.append(proc_detail)
+            elif any(keyword in description for keyword in consult_keywords):
+                pending_consults.append(proc_detail)
+    
+    return {
+        "pending_procedures": pending,
+        "pending_labs": pending_labs,
+        "pending_scans": pending_scans,
+        "pending_consults": pending_consults,
+        "total_pending": len(pending)
+    }
+
+@FunctionTool
+def check_discharge_readiness(patient_id: str, identity_result: Dict[str, Any], 
+                             billing_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Check discharge readiness based on fraud analysis results.
+    
+    If identity or billing fraud is detected, discharge may be blocked for investigation.
+    
+    Args:
+        patient_id: Patient UUID
+        identity_result: Results from identity fraud agent
+        billing_result: Results from billing fraud agent
+        
+    Returns:
+        Dictionary containing:
+        - fraud_blocker: Boolean indicating if fraud blocks discharge
+        - fraud_reasons: List of fraud-related blockers
+        - can_discharge_despite_fraud: Boolean indicating if discharge allowed despite fraud
+    """
+    logger.info(f"Checking discharge readiness for patient: {patient_id}")
+    
+    fraud_blocker = False
+    fraud_reasons = []
+    
+    # Check identity fraud
+    identity_score = identity_result.get("fraud_risk_score", 0)
+    identity_flag = identity_result.get("identity_misuse_flag", False)
+    
+    if identity_flag or identity_score >= 70:
+        fraud_blocker = True
+        fraud_reasons.append(f"Identity fraud detected (risk score: {identity_score})")
+    
+    # Check billing fraud
+    billing_score = billing_result.get("billing_risk_score", 0)
+    billing_flags = billing_result.get("billing_flags", [])
+    
+    if billing_score >= 70 or any("fraud" in str(flag).lower() for flag in billing_flags):
+        fraud_blocker = True
+        fraud_reasons.append(f"Billing fraud detected (risk score: {billing_score})")
+    
+    # Determine if discharge allowed despite fraud (low severity)
+    can_discharge_despite_fraud = (
+        identity_score < 50 and 
+        billing_score < 50 and 
+        not identity_flag
+    )
+    
+    return {
+        "fraud_blocker": fraud_blocker,
+        "fraud_reasons": fraud_reasons,
+        "can_discharge_despite_fraud": can_discharge_despite_fraud
+    }
 

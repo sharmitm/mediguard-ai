@@ -12,7 +12,7 @@ import sys
 import os
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 
@@ -21,6 +21,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from main import (
     analyze_patient,
+    analyze_patient_async,
     analyze_agent1_only,
     get_sample_patient_ids,
     fetch_patient_data
@@ -50,7 +51,7 @@ async def log_requests(request: Request, call_next):
         "event": "api_request",
         "method": request.method,
         "path": request.url.path,
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }))
     
     response = await call_next(request)
@@ -63,7 +64,7 @@ async def log_requests(request: Request, call_next):
         "path": request.url.path,
         "status_code": response.status_code,
         "duration_ms": duration,
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }))
     
     return response
@@ -104,12 +105,9 @@ async def analyze_patient_endpoint(request: PatientAnalysisRequest):
             logger.error(f"Patient validation failed: {str(e)}")
             raise HTTPException(status_code=404, detail=str(e))
         
-        # Run full analysis - get the full workflow state, not just final
-        # Use thread pool executor to run sync function that uses asyncio.run()
+        # Run full analysis - call async function directly (no executor needed)
         logger.info(f"Starting analysis for patient: {request.patient_id}")
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor() as executor:
-            workflow_result = await loop.run_in_executor(executor, analyze_patient, request.patient_id)
+        workflow_result = await analyze_patient_async(request.patient_id)
         logger.info(f"Analysis completed for patient: {request.patient_id}")
         
         # Extract results from workflow state

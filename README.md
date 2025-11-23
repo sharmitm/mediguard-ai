@@ -4,6 +4,14 @@ A multi-agent AI system for healthcare fraud detection and discharge management 
 
 ![MediGuard AI Dashboard](img/dashboard-patient-input.png)
 
+## 🎬 Demo Video
+
+Watch the system in action! See how the three-agent workflow analyzes patient data and detects fraud patterns:
+
+[![MediGuard AI Demo Video](https://img.youtube.com/vi/szNQj8By6nU/maxresdefault.jpg)](https://youtu.be/szNQj8By6nU?si=HB0-oKmbSg5Ooonc)
+
+**[📺 Watch on YouTube](https://youtu.be/szNQj8By6nU?si=HB0-oKmbSg5Ooonc)**
+
 ## 🎯 Features
 
 ### Three Specialized AI Agents
@@ -22,10 +30,12 @@ A multi-agent AI system for healthcare fraud detection and discharge management 
    - Checks for duplicate/add-on procedures and charges above normal ranges
    - Uses custom tools: `calculate_claim_statistics`, `analyze_diagnosis_procedure_match`
 
-3. **Agent 3: Discharge Blockers Assessment** *(Currently disabled - awaiting implementation)*
+3. **Agent 3: Discharge Blockers Assessment**
    - Determines what's preventing patient discharge
-   - Identifies blockers (pending labs, scans, paperwork, etc.)
+   - Identifies blockers (pending labs, scans, paperwork, fraud investigations)
+   - Checks for active inpatient encounters
    - Estimates delay hours if not ready for discharge
+   - Uses custom tools: `get_active_encounters`, `get_pending_procedures`, `check_discharge_readiness`
 
 ### Modern Web Interface
 
@@ -193,7 +203,7 @@ The system uses a **sequential workflow** where agents run one after another:
 
 1. **Identity Agent** → Analyzes patient data for fraud patterns using multiple tools
 2. **Billing Agent** → Uses identity results to assess billing fraud
-3. **Discharge Agent** → (Currently disabled) Uses both results for discharge assessment
+3. **Discharge Agent** → Uses identity and billing results to assess discharge readiness and identify blockers
 
 Each agent makes tool calls to access data, then performs LLM analysis via Gemini API before passing results to the next agent.
 
@@ -262,7 +272,13 @@ npm run start    # Production server
 - `POST /api/analyze` - Proxy to backend analysis
 - `GET /api/sample-ids` - Proxy to backend sample IDs
 
-## 📸 Screenshots
+## 📸 Screenshots & Demo
+
+### Demo Video
+
+[![MediGuard AI Demo Video](https://img.youtube.com/vi/szNQj8By6nU/maxresdefault.jpg)](https://youtu.be/szNQj8By6nU?si=HB0-oKmbSg5Ooonc)
+
+**[🎥 Watch Full Demo Video](https://youtu.be/szNQj8By6nU?si=HB0-oKmbSg5Ooonc)** - See the complete workflow in action!
 
 ### Dashboard Views
 
@@ -315,7 +331,7 @@ npm run start    # Production server
 
 - ✅ **Agent 1 (Identity)**: Fully implemented and working
 - ✅ **Agent 2 (Billing)**: Fully implemented and working
-- ⏳ **Agent 3 (Discharge)**: Disabled - awaiting teammate's implementation
+- ✅ **Agent 3 (Discharge)**: Fully implemented and working
 - ✅ **Frontend**: Fully functional with real-time workflow visualization
 - ✅ **Backend API**: Complete with error handling and logging
 
