@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<!-- saved from url=(0053)file:///Users/sharmi/Downloads/mediguard_ai_blog.html -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+  
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MediGuard AI — A Multi-Agent Healthcare Fraud Detection System</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial; line-height:1.6; color:#111; max-width:900px; margin:40px auto; padding:0 20px; }
+    h1 { font-size:2.2rem; margin-bottom:0.2rem; }
+    h2 { font-size:1.3rem; margin-top:1.6rem; }
+    h3 { font-size:1.05rem; margin-top:1.2rem; }
+    p { margin:0.6rem 0; }
+    pre { background:#f6f8fa; padding:16px; overflow:auto; border-radius:6px; }
+    code { background:#f6f8fa; padding:2px 6px; border-radius:4px; font-family:monospace; }
+    ul { margin:0.4rem 0 0.8rem 1.2rem; }
+    .meta { color:#5a5a5a; margin-bottom:1rem; }
+    .lead { font-size:1rem; color:#333; }
+    .section { margin-top:1rem; }
+    blockquote { border-left:4px solid #ddd; padding-left:12px; color:#555; margin:0.8rem 0; background:#fbfbfb; padding:12px 16px; border-radius:6px; }
+    footer { color:#666; font-size:0.9rem; margin-top:2rem; border-top:1px solid #eee; padding-top:12px; }
+  </style>
+</head>
+<body>
+<article>
+  <header>
+    <h1>MediGuard AI — A Multi-Agent Healthcare Fraud Detection System</h1>
+    <p class="meta">A technical overview of a Google ADK + Gemini-powered platform for identity, billing, and discharge-risk detection.</p>
+  </header>
+
+  <section class="lead">
+    <p>Healthcare fraud, billing errors, and discharge delays cost hospitals and insurers billions each year. <strong>MediGuard AI</strong> is a multi-agent, AI-powered system designed to analyze patient claims data and automatically detect identity misuse, billing anomalies, and operational blockers using Google’s Agent Development Kit (ADK) and Gemini models.</p>
+  </section>
+
+  <h2>What MediGuard AI Does</h2>
+  <p>MediGuard AI processes synthetic patient and claims data and runs it through a <strong>3-agent sequential pipeline</strong>:</p>
+  <ul>
+    <li>Identity &amp; Claims Fraud Detection</li>
+    <li>Billing Fraud Analysis</li>
+    <li>Discharge Blocker Assessment</li>
+  </ul>
+  <p>The system outputs a unified fraud and discharge readiness report, providing hospital-grade decision support.</p>
+
+  <h2>System Architecture</h2>
+  <h3>Data Sources</h3>
+  <p>The system loads synthetic healthcare data in <strong>Synthea</strong> format:</p>
+  <ul>
+    <li><code>patients.csv</code> — Demographics</li>
+    <li><code>claims.csv</code> — Claim summaries</li>
+    <li><code>claim_lines.csv</code> — Itemized billing</li>
+    <li><code>encounters.csv</code> — Hospital visits</li>
+    <li><code>procedures.csv</code> — Completed and pending procedures</li>
+  </ul>
+  <p>These are stored as <strong>Pandas DataFrames</strong> for fast, in-memory querying.</p>
+
+  <h2>The Three AI Agents</h2>
+  <p>MediGuard AI uses a <em>sequential multi-agent pipeline</em>, where each agent’s output feeds into the next.</p>
+
+  <h3>Agent 1 — Identity &amp; Claims Fraud Detection</h3>
+  <p><strong>Focus:</strong> Identity misuse and diagnosis/procedure inconsistencies.</p>
+  <ul>
+    <li>Duplicate or mismatched SSN, DOB, name, or address</li>
+    <li>Conflicting demographic records across claims</li>
+    <li>Diagnosis–procedure mismatches</li>
+    <li>Unrealistic or abnormal claim amounts</li>
+  </ul>
+  <p><strong>Output:</strong> <code>fraud_risk_score</code> (0–100), <code>identity_misuse_flag</code>, <code>reasons[]</code></p>
+
+  <h3>Agent 2 — Billing Fraud Analysis</h3>
+  <p><strong>Focus:</strong> Billing patterns and cost anomalies.</p>
+  <ul>
+    <li>Duplicate procedures</li>
+    <li>Add-on or unbundled billing</li>
+    <li>Cost outliers (high/low)</li>
+    <li>Diagnosis–procedure mismatches (re-validated)</li>
+  </ul>
+  <p><strong>Output:</strong> <code>billing_risk_score</code> (0–100), <code>billing_flags[]</code>, <code>billing_explanation</code></p>
+
+  <h3>Agent 3 — Discharge Blockers Assessment</h3>
+  <p><strong>Focus:</strong> Operational readiness and fraud-dependent blocking.</p>
+  <ul>
+    <li>Active inpatient encounters</li>
+    <li>Pending labs, imaging, or consults</li>
+    <li>Delays caused by fraud investigations</li>
+  </ul>
+  <p><strong>Output:</strong> <code>discharge_ready</code> (boolean), <code>blockers[]</code>, <code>delay_hours</code></p>
+
+  <h2>Key Tools Available to Agents</h2>
+  <ul>
+    <li><code>fetch_patient_data_tool</code> — retrieves patient records</li>
+    <li><code>calculate_claim_statistics</code> — computes averages, outliers, ranges</li>
+    <li><code>check_patient_consistency</code> — validates demographic alignment</li>
+    <li><code>analyze_diagnosis_procedure_match</code> — checks coding correctness</li>
+    <li><code>get_active_encounters</code> — identifies current hospitalizations</li>
+    <li><code>get_pending_procedures</code> — lists incomplete clinical tasks</li>
+    <li><code>check_discharge_readiness</code> — determines discharge blockers</li>
+  </ul>
+
+  <h2>Technology Stack</h2>
+  <table>
+    <tbody><tr><td><strong>Framework</strong></td><td>Google ADK (Agent Development Kit)</td></tr>
+    <tr><td><strong>AI Model</strong></td><td>Gemini 2.5 Flash Lite</td></tr>
+    <tr><td><strong>Language</strong></td><td>Python (async/await)</td></tr>
+    <tr><td><strong>Data Engine</strong></td><td>Pandas DataFrames</td></tr>
+    <tr><td><strong>Session Handling</strong></td><td>In-memory ADK sessions</td></tr>
+  </tbody></table>
+
+  <h2>Workflow Overview</h2>
+  <pre>Patient ID
+   ↓
+Agent 1: Identity Analysis
+   ↓
+Agent 2: Billing Analysis
+   ↓
+Agent 3: Discharge Assessment
+   ↓
+Final Structured Report
+  </pre>
+
+  <h2>Key Features</h2>
+  <ol>
+    <li>Sequential Agent Processing</li>
+    <li>Autonomous Tool Calling</li>
+    <li>Strict JSON Validation</li>
+    <li>Async Execution for performance</li>
+    <li>Follow-up Mechanism for missing outputs</li>
+    <li>Session Isolation</li>
+    <li>Robust Error Handling &amp; Logging</li>
+  </ol>
+
+  <h2>Example Output</h2>
+  <pre>{
+  "patient_id": "uuid",
+  "identity": {
+    "fraud_risk_score": 45,
+    "identity_misuse_flag": true,
+    "reasons": ["Duplicate patient info", "Suspicious diagnosis"]
+  },
+  "billing": {
+    "billing_risk_score": 15,
+    "billing_flags": ["normal_range"],
+    "billing_explanation": "No billing anomalies"
+  },
+  "discharge": {
+    "discharge_ready": false,
+    "blockers": ["Pending blood lab", "Fraud investigation"],
+    "delay_hours": 36
+  },
+  "raw": {},
+  "final": {}
+}</pre>
+
+  <h2>Use Cases</h2>
+  <ul>
+    <li>Insurance fraud detection</li>
+    <li>Hospital billing QA</li>
+    <li>Compliance &amp; audit workflows</li>
+    <li>Discharge planning optimization</li>
+    <li>Identity theft prevention in healthcare</li>
+  </ul>
+
+  <h2>Main Functions</h2>
+  <ul>
+    <li><code>analyze_patient(patient_id)</code> — Full 3-agent pipeline</li>
+    <li><code>analyze_agent1_only(patient_id)</code> — Identity-only</li>
+    <li><code>fetch_patient_data(patient_id)</code> — Raw data retrieval</li>
+  </ul>
+
+  <h2>Conclusion</h2>
+  <p>MediGuard AI automates a multi-step healthcare fraud investigation process that typically requires several human reviewers. By combining structured datasets, deterministic tools, and multi-agent Gemini reasoning, the system delivers fast, consistent, and scalable fraud detection and discharge support.</p>
+
+  <footer>
+    <p>Want this published somewhere (Medium, GitHub Pages) or need a downloadable README/Markdown? I can prepare and export it—just tell me where you want it published.</p>
+  </footer>
+</article>
+
+
+</body></html>
